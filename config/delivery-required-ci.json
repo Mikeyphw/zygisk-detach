@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "repository": "Mikeyphw/zygisk-detach",
+  "base_branch": "master",
+  "event": "pull_request",
+  "release_qualification": "separate",
+  "required_workflows": [
+    {"name": "Zygisk Detach / Regression and Build Qualification", "workflow_id": 420615431}
+  ]
+}

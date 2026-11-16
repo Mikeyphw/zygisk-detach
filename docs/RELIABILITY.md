@@ -106,3 +106,21 @@ root manager must support a Zygisk provider and load its hook for Play Store.
 KernelSU app icons use the manager-local `ksu://icon/` handler documented by
 KernelSU. If it is unsupported, fallback monograms appear; no privileged icon
 extraction process or network image URLs are introduced.
+
+## CI host CLI regression and required checks
+
+The Linux smoke test intentionally uses a basename-only `detach.bin` in an
+isolated temporary working directory. Rust's `Path::parent()` returns an
+empty path for bare filenames; filesystem syncing requires `.` instead.
+The CLI now normalizes this parent for lock, backup, and atomic directory
+sync while retaining the original relative configuration filename. This
+prevents a successfully renamed config from incorrectly returning ENOENT.
+
+Required hosted CI is controlled by committed
+`config/delivery-required-ci.json`: the exact workflow name and GitHub ID
+are checked against the current PR HEAD. A push run cannot qualify PR CI.
+The workflow triggers on PRs targeting master, master pushes and explicit
+dispatch; it does not duplicate branch-push and PR jobs for the same feature
+branch. Every current Python test (including CI-policy regressions) runs.
+Android/NDK packaging remains unqualified until its hosted job and the
+physical-device acceptance both pass. A skipped job is never a pass.

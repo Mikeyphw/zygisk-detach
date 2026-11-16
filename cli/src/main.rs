@@ -7,7 +7,7 @@ use std::panic::Location;
 use std::process::{Command, ExitCode};
 
 use termion::event::Key;
-use termion::{clear, cursor, terminal_size};
+use termion::{clear, cursor};
 
 mod colorize;
 use colorize::ToColored;

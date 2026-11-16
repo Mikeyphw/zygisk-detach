@@ -79,7 +79,7 @@ pub fn load(path: &Path) -> io::Result<Vec<String>> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() { return invalid("configuration symlink refused"); }
     }
-    let mut file = match File::open(path) {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -90,10 +90,17 @@ pub fn load(path: &Path) -> io::Result<Vec<String>> {
     decode(&data)
 }
 
+// A basename-only relative configuration has an empty Path::parent().
+// Its directory is the current directory, not an empty OS path.
+fn config_parent(path: &Path) -> io::Result<&Path> {
+    let parent = path.parent().ok_or_else(|| error("configuration parent missing"))?;
+    Ok(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })
+}
+
 struct FileLock(File);
 #[cfg(unix)] unsafe extern "C" { fn flock(fd: i32, operation: i32) -> i32; }
 fn lock(path: &Path) -> io::Result<FileLock> {
-    let dir = path.parent().ok_or_else(|| error("missing configuration directory"))?;
+    let dir = config_parent(path)?;
     fs::create_dir_all(dir)?;
     let lock_path = dir.join(".detach.lock");
     if let Ok(meta) = fs::symlink_metadata(&lock_path) {
@@ -113,7 +120,7 @@ impl Drop for FileLock {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().ok_or_else(|| error("missing parent directory"))?;
+    let dir = config_parent(path)?;
     fs::create_dir_all(dir)?;
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() { return invalid("refusing to overwrite symlink"); }
@@ -142,7 +149,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn backups_dir(path: &Path) -> io::Result<PathBuf> {
-    let dir = path.parent().ok_or_else(|| error("configuration parent missing"))?.join("backups");
+    let dir = config_parent(path)?.join("backups");
     if let Ok(meta) = fs::symlink_metadata(&dir) {
         if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
             return invalid("backup directory is not an ordinary directory");
@@ -236,6 +243,14 @@ where F: FnOnce(&mut Vec<String>) -> io::Result<()> {
         let path = std::env::temp_dir().join(format!("zd-test-{}-{}-{}", std::process::id(), name,
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
         fs::create_dir_all(&path).unwrap(); path
+    }
+    #[test] fn basename_parent_is_current_directory() {
+        assert_eq!(config_parent(Path::new("detach.bin")).unwrap(), Path::new("."));
+        assert_eq!(config_parent(Path::new("./detach.bin")).unwrap(), Path::new("."));
+        let dir = temporary("explicit-parent");
+        let path = dir.join("detach.bin");
+        assert_eq!(config_parent(&path).unwrap(), dir.as_path());
+        let _ = fs::remove_dir_all(dir);
     }
     #[test] fn legacy_roundtrip() {
         let names = vec!["com.google.android.youtube".to_string(), "org.example_app.demo".to_string()];

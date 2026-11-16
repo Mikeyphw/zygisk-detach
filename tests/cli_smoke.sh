@@ -11,7 +11,11 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 cd "$tmp"
 "$cli" reset
+"$cli" list >actual
+[ ! -s actual ] || { echo 'reset left nonempty config' >&2; exit 1; }
 "$cli" detach com.example.one com.example.two
+[ -s detach.bin ] || { echo 'relative configuration was not persisted' >&2; exit 1; }
+[ -d backups ] || { echo 'relative configuration backups directory missing' >&2; exit 1; }
 printf '%s\n' com.example.one com.example.two >expected
 "$cli" list >actual
 diff -u expected actual
@@ -19,6 +23,7 @@ diff -u expected actual
 "$cli" list >actual
 diff -u expected actual
 "$cli" reattach com.example.one
+[ -s detach.bin ] || { echo 'reattach lost configuration' >&2; exit 1; }
 printf '%s\n' com.example.two >expected
 "$cli" list >actual
 diff -u expected actual
