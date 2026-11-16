@@ -12,6 +12,9 @@
 #include <unistd.h>
 
 #include "binder.hpp"
+#include "legacy_codec.hpp"
+#include "parcel_bounds.hpp"
+#include <atomic>
 #include "zygisk.hpp"
 
 #define ARR_LEN(a) (sizeof(a) / sizeof((a)[0]))
@@ -21,38 +24,40 @@
 #define PM_DESC u"android.content.pm.IPackageManager"
 
 static char* DETACH_TXT = nullptr;
+static size_t DETACH_LEN = 0;
 static size_t HEADERS_LEN = 0;
 static uint32_t getApplicationEnabledSetting_code = 0;
 
 static inline void detach(PParcel* pparcel, uint32_t code) {
-    auto parcel = FakeParcel(pparcel->data);
-    if (pparcel->data_size < HEADERS_LEN + 4) return;
-    parcel.skip(HEADERS_LEN);  // header
-
-    auto descLen = parcel.readInt32();
-    auto desc = parcel.readString16(descLen);
-
-    if (code != getApplicationEnabledSetting_code ||
-        STR_LEN(PM_DESC) != descLen ||
-        memcmp(desc, PM_DESC, descLen * sizeof(char16_t)) != 0) {
+    if (!pparcel || !pparcel->data || !DETACH_TXT || !DETACH_LEN ||
+        code != getApplicationEnabledSetting_code) return;
+    if (pparcel->data_size > 1024 * 1024) return;
+    detach_parcel::Cursor cursor{
+        reinterpret_cast<const unsigned char*>(pparcel->data),pparcel->data_size,0};
+    if (!cursor.skip(HEADERS_LEN)) return;
+    uint32_t desc_len=0;
+    if (!cursor.read_u32(desc_len) || desc_len!=STR_LEN(PM_DESC)) return;
+    const char16_t* desc=nullptr;
+    if (!cursor.read_utf16(desc_len,desc)) return;
+    if (memcmp(desc,PM_DESC,desc_len*sizeof(char16_t))!=0) return;
+    if (!cursor.skip(2)) return; // original Parcel String16 alignment field
+    uint32_t pkg_len=0;
+    if (!cursor.read_u32(pkg_len) || pkg_len==0 || pkg_len>127) return;
+    const char16_t* const_name=nullptr;
+    if (!cursor.read_utf16(pkg_len,const_name)) return;
+    const size_t encoded_len=static_cast<size_t>(pkg_len)*2-1;
+    size_t index=0;
+    while (index < DETACH_LEN) {
+        const size_t len=static_cast<unsigned char>(DETACH_TXT[index++]);
+        if (!len || len>DETACH_LEN-index) return;
+        const char* entry=DETACH_TXT+index;
+        index+=len;
+        if (len!=encoded_len || memcmp(entry,const_name,len)!=0) continue;
+        // Only record real matching Binder interceptions. No package names logged.
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) LOGD("HOOK_OBSERVED");
+        const_cast<char16_t*>(const_name)[0]=0;
         return;
-    }
-    parcel.skip(2);
-
-    auto pkgLen = parcel.readInt32();
-    auto pkg = parcel.readString16(pkgLen);
-
-    auto pkgLenB = (uint8_t)(pkgLen * 2 - 1);
-    size_t i = 0;
-    uint8_t dlen;
-    while ((dlen = DETACH_TXT[i])) {
-        const char* dptr = DETACH_TXT + i + sizeof(dlen);
-        i += sizeof(dlen) + dlen;
-        if (dlen != pkgLenB) continue;
-        if (memcmp(dptr, pkg, dlen) == 0) {
-            *pkg = 0;
-            return;
-        }
     }
 }
 
@@ -65,27 +70,39 @@ int transact_hook(void* self, int32_t handle, uint32_t code, void* pdata, void* 
 }
 
 static size_t read_companion(int fd) {
-    off_t size;
-    if (read(fd, &size, sizeof(size)) < 0) {
-        LOGD("ERROR read: %s", strerror(errno));
+    off_t size = 0;
+    if (!readFullFromFd(fd, &size, sizeof(size))) {
+        LOGD("ERROR read_companion: truncated size header");
         return 0;
     }
-    if (size <= 0) {
-        LOGD("ERROR read_companion: size=%ld", size);
+    constexpr size_t MAX_CONFIG = 1024 * 1024;
+    if (size <= 0 || static_cast<uint64_t>(size) > MAX_CONFIG) {
+        LOGD("ERROR read_companion: invalid config size");
         return 0;
     }
-    DETACH_TXT = (char*)malloc(size + 1);
-
-    if (!readFullFromFd(fd, DETACH_TXT, size)) return 0;
-
-    DETACH_TXT[size] = 0;
-    return (size_t)size;
+    char* tmp = static_cast<char*>(malloc(static_cast<size_t>(size) + 1));
+    if (!tmp) return 0;
+    if (!readFullFromFd(fd, tmp, size)) {
+        free(tmp);
+        LOGD("ERROR read_companion: truncated payload");
+        return 0;
+    }
+    if (!detach_codec::validate(tmp,static_cast<size_t>(size))) {
+        LOGD("ERROR read_companion: invalid configuration encoding");
+        free(tmp);
+        return 0;
+    }
+    tmp[size] = 0;
+    DETACH_TXT = tmp;
+    DETACH_LEN = static_cast<size_t>(size);
+    return DETACH_LEN;
 }
 
 static bool runPreSpecialize(const char* process, zygisk::Api* api) {
     if (strncmp(process, VENDING_PROC, STR_LEN(VENDING_PROC)) != 0) return false;
 
     int fd = api->connectCompanion();
+    if (fd < 0) { LOGD("ERROR companion connection"); return false; }
     size_t detach_len = read_companion(fd);
     close(fd);
     if (detach_len == 0) return false;
@@ -119,7 +136,7 @@ static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env
         return false;
     }
 
-    LOGD("Loaded %s", process);
+    LOGD("HOOK_INSTALLED");
     return true;
 }
 
@@ -154,6 +171,8 @@ class ZygiskDetach : public zygisk::ModuleBase {
 
     void cleanup(const zygisk::AppSpecializeArgs* args) {
         free(DETACH_TXT);
+        DETACH_TXT = nullptr;
+        DETACH_LEN = 0;
         env->ReleaseStringUTFChars(args->nice_name, process);
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }

@@ -1,10 +1,8 @@
 use std::error::Error;
 use std::fmt::{Debug, Display};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek};
-use std::io::{BufWriter, Read, Write};
-use std::mem::size_of;
-use std::ops::Range;
+use std::fs;
+use std::io;
+use std::io::{Read, Write};
 use std::panic::Location;
 use std::process::{Command, ExitCode};
 
@@ -16,6 +14,9 @@ use colorize::ToColored;
 
 mod menus;
 use menus::Menus;
+mod config;
+mod doctor;
+use std::path::Path;
 
 #[cfg(target_os = "android")]
 const MODULE_DETACH: &str = "/data/adb/zygisk-detach/detach.bin";
@@ -64,9 +65,7 @@ fn main() -> ExitCode {
         );
     }));
 
-    if !std::path::Path::new("/data/adb/zygisk-detach/").exists() {
-        std::fs::create_dir("/data/adb/zygisk-detach/").expect("zygisk-detach path");
-    }
+    // Read-only CLI commands never create device state; config::lock creates it for mutations.
 
     let mut args = std::env::args().skip(1);
     if let Some(cmd) = args.next().as_deref() {
@@ -88,94 +87,164 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "detachall" => {
-                if args.len() == 0 {
+                let names: Vec<String> = args.collect();
+                if names.is_empty() {
                     eprintln!("ERROR: No Package name(s) was supplied.");
                     return ExitCode::FAILURE;
                 }
-                let mut f = fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(MODULE_DETACH)
-                    .expect("open detach.bin");
-                for pkg_name in args {
-                    bin_serialize(&pkg_name, &mut f).expect("write to detach.bin");
+                if let Err(err) = config::save(Path::new(MODULE_DETACH), &names) {
+                    eprintln!("ERROR: {err}");
+                    return ExitCode::FAILURE;
                 }
                 detach_bin_changed();
-                println!("Changes are applied. No need for a reboot!");
+                println!("Configuration saved. Runtime hook still requires verification.");
                 return ExitCode::SUCCESS;
             }
+
             "detach" => {
                 if args.len() == 0 {
                     eprintln!("ERROR: No Package name(s) was supplied.");
                     return ExitCode::FAILURE;
                 }
-                for pkg_name in args {
-                    if !detach_by_name(&pkg_name).expect("detach.txt") {
-                        println!("already detached: {}", pkg_name);
+                let requested: Vec<String> = args.collect();
+                if requested.is_empty() { eprintln!("ERROR: No package names"); return ExitCode::FAILURE; }
+                let result = config::update(Path::new(MODULE_DETACH), |names| {
+                    for name in &requested {
+                        if !config::valid_package(name) {
+                            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid package name"));
+                        }
+                        if !names.contains(name) { names.push(name.clone()); }
                     }
+                    Ok(())
+                });
+                match result {
+                    Ok(changed) => {
+                        if changed { detach_bin_changed(); }
+                        println!("Configuration {}. Hook remains unverified.", if changed {"saved"} else {"unchanged"});
+                    },
+                    Err(e) => { eprintln!("ERROR: {e}"); return ExitCode::FAILURE; }
                 }
-                println!("Changes are applied. No need for a reboot!");
                 return ExitCode::SUCCESS;
             }
             "reset" => {
-                match fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(MODULE_DETACH)
-                {
-                    Ok(_) => detach_bin_changed(),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        eprintln!("ERROR: Could not delete '{MODULE_DETACH}': {e}");
-                        return ExitCode::FAILURE;
-                    }
+                if let Err(err) = config::save(Path::new(MODULE_DETACH), &[]) {
+                    eprintln!("ERROR: {err}");
+                    return ExitCode::FAILURE;
                 }
+                detach_bin_changed();
+                println!("Configuration cleared.");
                 return ExitCode::SUCCESS;
             }
+
             "reattach" => {
                 let Some(pkg_name) = args.next() else {
                     eprintln!("ERROR: package name not supplied.");
                     return ExitCode::FAILURE;
                 };
-                if reattach_by_name(&pkg_name).expect("detach.txt") {
-                    println!("re-attached: {}", pkg_name);
+                match reattach_by_name(&pkg_name) {
+                    Ok(true) => println!("re-attached: {pkg_name}"),
+                    Ok(false) => println!("not detached: {pkg_name}"),
+                    Err(e) => { eprintln!("ERROR: {e}"); return ExitCode::FAILURE; }
                 }
                 return ExitCode::SUCCESS;
             }
             "list" => {
-                let mut detach_txt = match fs::OpenOptions::new()
-                    .write(true)
-                    .read(true)
-                    .open(MODULE_DETACH)
-                {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("ERROR: Could not list detached pkgs: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let mut content = Vec::new();
-                match detach_txt.read_to_end(&mut content) {
-                    Ok(0) => return ExitCode::SUCCESS,
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("ERROR: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                for (app, _) in get_detached_apps(&content) {
-                    println!("{app}");
+                match config::load(Path::new(MODULE_DETACH)) {
+                    Ok(names) => for name in names { println!("{name}"); },
+                    Err(e) => { eprintln!("ERROR: {e}"); return ExitCode::FAILURE; }
                 }
                 return ExitCode::SUCCESS;
             }
+            "verify" => {
+                if args.next().is_some() {eprintln!("ERROR: verify takes no arguments");return ExitCode::FAILURE;}
+                let names = match config::load(Path::new(MODULE_DETACH)) {
+                    Ok(names) => names,
+                    Err(e) => {eprintln!("ERROR: {e}");return ExitCode::FAILURE;}
+                };
+                let result = doctor::collect(names.len());
+                doctor::print(&result, false);
+                if result.hook_state == "observed_in_current_store_process" {return ExitCode::SUCCESS;}
+                eprintln!("HOOK_NOT_VERIFIED: configuration is not proof of detachment");
+                return ExitCode::FAILURE;
+            }
+            "status" | "doctor" => {
+                let names = match config::load(Path::new(MODULE_DETACH)) {
+                    Ok(names) => names,
+                    Err(e) => {eprintln!("ERROR: {e}");return ExitCode::FAILURE;}
+                };
+                let mut json = false;
+                let mut bundle: Option<String> = None;
+                while let Some(arg) = args.next() {
+                    match arg.as_str() {
+                        "--json" => json=true,
+                        "--bundle" if bundle.is_none() => {
+                            let Some(path) = args.next() else {eprintln!("ERROR: --bundle requires file path");return ExitCode::FAILURE;};
+                            bundle=Some(path);
+                        },
+                        _ => {eprintln!("ERROR: unexpected option {arg}");return ExitCode::FAILURE;}
+                    }
+                }
+                let report=doctor::collect(names.len());
+                if let Some(file) = bundle {
+                    if let Err(e)=doctor::write_bundle(&report,Path::new(&file)) {
+                        eprintln!("ERROR: diagnostic export refused: {e}");return ExitCode::FAILURE;
+                    }
+                }
+                doctor::print(&report,json);
+                return ExitCode::SUCCESS;
+            }
+
+            "backups" => {
+                match config::backups(Path::new(MODULE_DETACH)) {
+                    Ok(files) => for (i, file) in files.iter().enumerate() {
+                        println!("{i}: {}",file.file_name().unwrap_or_default().to_string_lossy());
+                    },
+                    Err(e) => { eprintln!("ERROR: {e}"); return ExitCode::FAILURE; }
+                }
+                return ExitCode::SUCCESS;
+            }
+            "backup" => {
+                match config::backup(Path::new(MODULE_DETACH)) {
+                    Ok(file) => println!("Backup saved: {}",file.display()),
+                    Err(e) => { eprintln!("ERROR: {e}"); return ExitCode::FAILURE; }
+                }
+                return ExitCode::SUCCESS;
+            }
+            "restore" => {
+                let Some(value) = args.next() else { eprintln!("ERROR: restore requires backup index"); return ExitCode::FAILURE; };
+                let index = match value.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {eprintln!("ERROR: invalid backup index");return ExitCode::FAILURE;}
+                };
+                if args.next().is_some() {eprintln!("ERROR: too many arguments");return ExitCode::FAILURE;}
+                match config::restore(Path::new(MODULE_DETACH), index) {
+                    Ok(()) => {detach_bin_changed(); println!("Backup restored; live hook unverified");},
+                    Err(e) => { eprintln!("ERROR: {e}");return ExitCode::FAILURE; }
+                }
+                return ExitCode::SUCCESS;
+            }
+            "export" => {
+                match config::load(Path::new(MODULE_DETACH)) {
+                    Ok(names) => for name in names { println!("{name}"); },
+                    Err(e) => { eprintln!("ERROR: {e}"); return ExitCode::FAILURE; }
+                }
+                return ExitCode::SUCCESS;
+            }
+            "import" => {
+                let Some(path) = args.next() else { eprintln!("ERROR: import requires a file path"); return ExitCode::FAILURE; };
+                let result = config::import_file(Path::new(&path))
+                    .and_then(|names| config::save(Path::new(MODULE_DETACH), &names));
+                if let Err(e) = result { eprintln!("ERROR: {e}"); return ExitCode::FAILURE; }
+                detach_bin_changed();
+                println!("Configuration imported; runtime hook remains unverified.");
+                return ExitCode::SUCCESS;
+            }
+
             s => {
                 eprintln!(
                     "\
 Unexpected command: {s}
-Accepted commands are: 'detach', 'detachall', 'reset', 'list', 'serialize'"
+Accepted commands are: 'detach', 'detachall', 'reattach', 'reset', 'list', 'serialize', 'status', 'doctor', 'verify', 'export', 'import', 'backups', 'backup', 'restore'"
                 );
                 return ExitCode::FAILURE;
             }
@@ -208,19 +277,9 @@ fn detach_bin_changed() {
 }
 
 fn serialize_txt(txt: &str, bin: &str) -> IOResult<()> {
-    let mut detach_bin = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(bin)?;
-    for app in std::fs::read_to_string(txt)?
-        .lines()
-        .map(|s| s.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-    {
-        println!("  '{}'", app);
-        bin_serialize(app, &mut detach_bin)?;
-    }
+    let contents = fs::read_to_string(txt)?;
+    let names = config::from_text(&contents)?;
+    config::save(Path::new(bin), &names)?;
     Ok(())
 }
 
@@ -232,11 +291,11 @@ fn interactive(menus: &mut Menus) -> IOResult<()> {
             Op::DetachSelect => detach_menu(menus)?,
             Op::ReattachSelect => reattach_menu(menus)?,
             Op::Reset => {
-                if fs::remove_file(MODULE_DETACH).is_ok() {
-                    let _ = kill_store();
+                if config::save(Path::new(MODULE_DETACH), &[]).is_ok() {
+                    detach_bin_changed();
                     text!(menus, "Reset");
                 } else {
-                    text!(menus, "Already empty");
+                    return Err(io::Error::new(io::ErrorKind::Other, "could not reset configuration").into());
                 }
             }
             Op::CopyToSd => {
@@ -259,81 +318,32 @@ fn interactive(menus: &mut Menus) -> IOResult<()> {
 }
 
 fn reattach_menu(menus: &mut Menus) -> IOResult<()> {
-    let mut detach_txt = match fs::OpenOptions::new()
-        .write(true)
-        .read(true)
-        .open(MODULE_DETACH)
-    {
-        Ok(v) => v,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            text!(menus, "detach.bin not found");
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let mut content = Vec::new();
-    detach_txt.read_to_end(&mut content)?;
-    detach_txt.seek(io::SeekFrom::Start(0))?;
-    let detached_apps = get_detached_apps(&content);
-    let detach_len = detached_apps.len();
-    if detach_len == 0 {
-        text!(menus, "detach.bin is empty");
+    let names = config::load(Path::new(MODULE_DETACH))?;
+    if names.is_empty() {
+        text!(menus, "No detached packages");
         return Ok(());
     }
-    let list = detached_apps.iter().map(|e| e.0.as_str());
     let Some(i) = menus.select_menu(
-        list,
+        names.iter().map(String::as_str),
         "Select the app to re-attach ('q' to leave):",
         "✖".red(),
         Some(Key::Char('q')),
-    )?
-    else {
-        return Ok(());
-    };
-
-    textln!(menus, "{}: {}", "re-attach".red(), detached_apps[i].0);
-    content.drain(detached_apps[i].1.clone());
-    detach_txt.set_len(0)?;
-    detach_txt.write_all(&content)?;
-    detach_bin_changed();
+    )? else { return Ok(()); };
+    if reattach_by_name(&names[i])? {
+        textln!(menus, "{}: {}", "re-attach".red(), names[i]);
+    }
     Ok(())
 }
 
 fn reattach_by_name(pkg_name: &str) -> IOResult<bool> {
-    let mut detach_txt = fs::OpenOptions::new()
-        .write(true)
-        .read(true)
-        .open(MODULE_DETACH)?;
-    let mut content = Vec::new();
-    detach_txt.read_to_end(&mut content)?;
-    detach_txt.seek(io::SeekFrom::Start(0))?;
-    let detached_apps = get_detached_apps(&content);
-    let Some(reattach_app) = detached_apps.iter().find(|(name, _)| name == pkg_name) else {
-        return Ok(false);
-    };
-    content.drain(reattach_app.1.clone());
-    detach_txt.set_len(0)?;
-    detach_txt.write_all(&content)?;
-    detach_bin_changed();
-    Ok(true)
-}
-
-fn get_detached_apps(detach_txt: &[u8]) -> Vec<(String, Range<usize>)> {
-    let mut i = 0;
-    let mut detached = Vec::new();
-    while i < detach_txt.len() {
-        let len: u8 = detach_txt[i];
-        const SZ_LEN: usize = size_of::<u8>();
-        i += SZ_LEN;
-        let Some(encoded_name) = &detach_txt.get(i..i + len as usize) else {
-            eprintln!("Corrupted detach.bin. Reset and try again.");
-            std::process::exit(1);
-        };
-        let name = String::from_utf8(encoded_name.iter().step_by(2).cloned().collect()).unwrap();
-        detached.push((name, i - SZ_LEN..i + len as usize));
-        i += len as usize;
+    if !config::valid_package(pkg_name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid package name").into());
     }
-    detached
+    let changed = config::update(Path::new(MODULE_DETACH), |names| {
+        names.retain(|name| name != pkg_name); Ok(())
+    })?;
+    if changed { detach_bin_changed(); }
+    Ok(changed)
 }
 
 #[cfg(target_os = "linux")]
@@ -402,22 +412,7 @@ fn main_menu(menus: &mut Menus) -> IOResult<Op> {
     }
 }
 
-fn bin_serialize(app: &str, f: &mut File) -> IOResult<()> {
-    let mut w = Vec::with_capacity(2 * app.len() - 1);
-    for b in app.as_bytes()[..app.len() - 1].iter().cloned() {
-        w.push(b);
-        w.push(0);
-    }
-    w.push(app.as_bytes()[app.len() - 1]);
-    let mut f = BufWriter::new(f);
-    f.write_all(&[w
-        .len()
-        .try_into()
-        .expect("app name cannot be longer than 255")])?;
-    f.write_all(&w)?;
-    f.flush()?;
-    Ok(())
-}
+
 
 fn detach_menu(menus: &mut Menus) -> IOResult<()> {
     let installed_apps = get_installed_apps()?;
@@ -431,7 +426,7 @@ fn detach_menu(menus: &mut Menus) -> IOResult<()> {
         .map(|e| std::str::from_utf8(e).expect("non utf-8 package names?"))
         .collect();
     menus.cursor_show()?;
-    let col = terminal_size().expect("could not get terminal size").0 as usize - 2;
+    // Preserve full package identifier even on a narrow terminal.
     let selected = menus.select_menu_with_input(
         |input| {
             let input = input.trim();
@@ -442,7 +437,7 @@ fn detach_menu(menus: &mut Menus) -> IOResult<()> {
                             .contains(&input.to_ascii_lowercase())
                     })
                     .take(5)
-                    .map(|s| &s[..col.min(s.len())])
+                    .copied()
                     .collect()
             } else {
                 Vec::new()
@@ -465,20 +460,15 @@ fn detach_menu(menus: &mut Menus) -> IOResult<()> {
 }
 
 fn detach_by_name(detach_app: &str) -> IOResult<bool> {
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(MODULE_DETACH)?;
-    let mut buf: Vec<u8> = Vec::new();
-    f.read_to_end(&mut buf)?;
-    if !get_detached_apps(&buf).iter().any(|(s, _)| s == detach_app) {
-        bin_serialize(detach_app, &mut f)?;
-        detach_bin_changed();
-        Ok(true)
-    } else {
-        Ok(false)
+    if !config::valid_package(detach_app) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid package name").into());
     }
+    let changed = config::update(Path::new(MODULE_DETACH), |names| {
+        if !names.iter().any(|name| name == detach_app) { names.push(detach_app.into()); }
+        Ok(())
+    })?;
+    if changed { detach_bin_changed(); }
+    Ok(changed)
 }
 
 fn _kill_store_am() -> IOResult<()> {

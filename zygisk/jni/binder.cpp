@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "module.hpp"
+#include "stream.hpp"
 
 bool getMapping(const char* lib_name, ino_t* inode, dev_t* dev) {
     FILE* fp = fopen("/proc/self/maps", "r");
@@ -19,7 +20,10 @@ bool getMapping(const char* lib_name, ino_t* inode, dev_t* dev) {
     while (fgets(mapbuf, sizeof(mapbuf), fp)) {
         unsigned int dev_major, dev_minor;
         int cur = 0;
-        sscanf(mapbuf, "%*s %s %*x %x:%x %lu %*s%n", flags, &dev_major, &dev_minor, inode, &cur);
+        unsigned long long inode_value = 0;
+        if (sscanf(mapbuf, "%*s %7s %*x %x:%x %llu %*s%n", flags,
+                   &dev_major, &dev_minor, &inode_value, &cur) != 4) continue;
+        *inode = static_cast<ino_t>(inode_value);
         if (cur < lib_name_len) continue;
         if (memcmp(&mapbuf[cur - lib_name_len], lib_name, lib_name_len) == 0 && flags[2] == 'x') {
             *dev = makedev(dev_major, dev_minor);
@@ -64,28 +68,25 @@ void companionSendFile(const char* path, int remote_fd) {
     size = st.st_size;
 
 defer:
-    if (write(remote_fd, &size, sizeof(size)) < 0) {
+    if (!detach_io::write_full(remote_fd, &size, sizeof(size))) {
         LOGD("ERROR write: %s", strerror(errno));
         size = 0;
     }
-    if (fd > 0) {
-        if (size > 0 && sendfile(remote_fd, fd, NULL, size) < 0) {
-            LOGD("ERROR sendfile: %s", strerror(errno));
+    if (fd >= 0) {
+        off_t offset = 0;
+        while (size > 0 && offset < size) {
+            ssize_t sent = sendfile(remote_fd, fd, &offset, static_cast<size_t>(size - offset));
+            if (sent == 0) { LOGD("ERROR sendfile: unexpected EOF"); break; }
+            if (sent < 0) {
+                if (errno == EINTR) continue;
+                LOGD("ERROR sendfile: %s", strerror(errno));
+                break;
+            }
         }
         close(fd);
     }
 }
 
 bool readFullFromFd(int fd, void* buf, off_t size) {
-    off_t size_read = 0;
-    while (size_read < size) {
-        ssize_t ret = read(fd, (char*)buf + size_read, size - size_read);
-        if (ret < 0) {
-            LOGD("ERROR read: %s", strerror(errno));
-            return false;
-        } else {
-            size_read += ret;
-        }
-    }
-    return true;
+    return size >= 0 && detach_io::read_full(fd, buf, static_cast<size_t>(size));
 }
