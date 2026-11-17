@@ -124,3 +124,20 @@ dispatch; it does not duplicate branch-push and PR jobs for the same feature
 branch. Every current Python test (including CI-policy regressions) runs.
 Android/NDK packaging remains unqualified until its hosted job and the
 physical-device acceptance both pass. A skipped job is never a pass.
+
+## Hosted Android SDK and NDK provisioning
+
+GitHub Actions Ubuntu runners expose Android command-line tools under
+`$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager`. The old
+`android-actions/setup-android@v3` action tried to install the removed
+`sdkmanager tools` package and failed before compilation. The hosted CI now
+uses the runner's existing command-line tools directly and installs or verifies
+**only** NDK `27.2.12479018`. It refuses absent SDK roots, missing managers,
+failed installs, missing NDK executables and incorrect NDK revisions.
+
+`tests/test_android_sdk_ci.py` executes the real SDK bootstrap with disposable
+mock SDK roots, asserting both success and strict refusals without downloading
+SDK tools on developer or test machines. This complements existing Rust, C++,
+WebUI and packaging regressions. An SDK bootstrap pass is only toolchain
+evidence; Android cross-compilation, module installation, Zygisk hooking and
+release qualification remain separate.

@@ -55,17 +55,14 @@ jobs:
     needs: [rust-cli-and-config, webui, native-portable, module-package-unit]
     steps:
       - uses: actions/checkout@v4
-      - uses: android-actions/setup-android@v3
+      - name: Verify hosted SDK and provision exact NDK
+        run: bash tools/ci_android_sdk.sh
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
-      - name: Install version-pinned NDK
-        run: |
-          sdkmanager --install 'ndk;27.2.12479018'
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - name: Cross-build 32/64-bit native Zygisk hook
         run: |
           "$ANDROID_NDK_HOME/ndk-build" -C zygisk -j 2
