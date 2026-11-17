@@ -1,0 +1,100 @@
+name: Zygisk Detach / Regression and Build Qualification
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust-cli-and-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Codec, diagnostics, CLI and negative tests
+        run: |
+          set -eu
+          rustc --edition=2024 --test cli/src/config.rs -o /tmp/zd-config-test
+          /tmp/zd-config-test
+          rustc --edition=2024 --test cli/src/doctor.rs -o /tmp/zd-doctor-test
+          /tmp/zd-doctor-test
+          cargo test --manifest-path cli/Cargo.toml
+          cargo build --manifest-path cli/Cargo.toml
+          sh tests/cli_smoke.sh "$PWD/cli/target/debug/cli"
+  webui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test tests/webui.test.mjs
+      - run: node --check ksu-webui/src/index.js
+      - run: node --check ksu-webui/src/logic.mjs
+      - run: node --check ksu-webui/src/metadata.mjs
+  native-portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: EOF, corrupt payload and Binder bounds harnesses
+        run: |
+          set -eu
+          for name in io_test codec_test parcel_test; do
+            c++ -std=c++17 -Wall -Wextra -Werror -o "/tmp/$name" "tests/$name.cpp"
+            "/tmp/$name"
+          done
+  module-package-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+  android-module-crossbuild:
+    runs-on: ubuntu-latest
+    needs: [rust-cli-and-config, webui, native-portable, module-package-unit]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify hosted SDK and provision exact NDK
+        run: bash tools/ci_android_sdk.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - name: Cross-build 32/64-bit native Zygisk hook
+        run: |
+          "$ANDROID_NDK_HOME/ndk-build" -C zygisk -j 2
+          test -s zygisk/libs/arm64-v8a/libzygisk_detach.so
+          test -s zygisk/libs/armeabi-v7a/libzygisk_detach.so
+      - name: Configure Android Rust linkers
+        run: |
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$NDK_BIN/armv7a-linux-androideabi26-clang" >> "$GITHUB_ENV"
+      - name: Cross-build Rust CLIs for both supported ABIs
+        run: |
+          set -eu
+          cargo build --manifest-path cli/Cargo.toml --release --target aarch64-linux-android
+          cargo build --manifest-path cli/Cargo.toml --release --target armv7-linux-androideabi
+      - name: Bundle WebUI using KernelSU's documented JS package
+        working-directory: ksu-webui
+        run: |
+          set -eu
+          npm install --no-audit --no-fund
+          npx --no-install parcel build src/index.html --dist-dir ../.zd-webroot --public-url ./ --no-source-maps
+      - name: Assemble and verify module ZIP from source
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/zygisk-output"
+          python3 tools/package_module.py --repo "$PWD" --webroot "$PWD/.zd-webroot" --build-root "$PWD" --output "$RUNNER_TEMP/zygisk-output/zygisk-detach-UNQUALIFIED-${GITHUB_SHA:0:12}.zip" > "$RUNNER_TEMP/zygisk-output/package-receipt.json"
+          cd "$RUNNER_TEMP/zygisk-output"
+          sha256sum *.zip > SHA256SUMS
+          python3 -c 'import json; x=json.load(open("package-receipt.json")); assert x["installable_structure_validated"] and not x["runtime_or_device_verified"]'
+      - name: Preserve module build and provenance (NOT a device qualification)
+        uses: actions/upload-artifact@v4
+        with:
+          name: zygisk-detach-unqualified-module-and-provenance
+          path: ${{ runner.temp }}/zygisk-output/*
+          if-no-files-found: error
